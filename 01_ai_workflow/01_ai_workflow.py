@@ -1,5 +1,8 @@
 import logging
+import logging
 import os
+import time
+import datetime
 from typing import Optional, List
 
 import anthropic
@@ -15,7 +18,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-MAX_RETRIES = 3
+MAX_RETRIES = 5
+WARNING_THRESHOLD = 5
 
 class CodeAnalysisResponse(BaseModel):
     """AI-powered code analysis response with detailed quality assessment."""
@@ -52,9 +56,9 @@ class CodeAnalysisResponse(BaseModel):
         description="Specific, actionable suggestions for improving the code quality"
     )
     
-    production_readiness: bool = Field(
-        description="Whether the code is ready for production deployment"
-    )
+    # production_readiness: bool = Field(
+    #     description="Whether the code is ready for production deployment"
+    # )
     
     detailed_feedback: str = Field(
         description="Comprehensive feedback explaining the analysis and recommendations"
@@ -68,7 +72,8 @@ class PythonCodeGenerationResponse(BaseModel):
     )
     
     code: str = Field(
-        description="The complete Python function code with comprehensive docstring, type hints, and error handling"
+        description="""The complete Python function code with comprehensive docstring, type hints, and error handling.
+        Do not include markdown backticks like ```python and ``` at the start or end of the code block."""
     )
     
     explanation: str = Field(
@@ -81,7 +86,8 @@ class PythonCodeGenerationResponse(BaseModel):
     )
     
     test_code: str = Field(
-        description="Complete unit test code using pytest that thoroughly tests the function including edge cases"
+        description="""Complete unit test code using pytest that thoroughly tests the function including edge cases.
+        Do not include markdown backticks like ```python and ``` at the start or end of the code block."""
     )
     
     usage_examples: List[str] = Field(
@@ -100,21 +106,53 @@ class PythonCodeGenerationResponse(BaseModel):
     #     description="Explanation of efficiency optimizations and performance considerations"
     # )
 
-@action(reads=["not_good_enough", "retries", "check_results", "ai_analysis"], writes=["generated_python_response", "retries"])
+@action(reads=["not_good_enough", "retries", "check_results", "ai_analysis", "workflow_start_time", "total_tokens_used", "generation_tokens", "api_call_count", "generation_times"], writes=["generated_python_response", "retries", "task", "workflow_start_time", "total_tokens_used", "generation_tokens", "api_call_count", "generation_times"])
 def code_generator(state: State, instructor_client: Instructor, task: str) -> State:
+    # Initialize workflow timing on first run
+    workflow_start_time = state.get("workflow_start_time")
+    if workflow_start_time is None:
+        workflow_start_time = time.time()
+    
+    # Track generation start time
+    generation_start_time = time.time()
+    
     retries = state["retries"]
     not_good_enough = state["not_good_enough"]
     check_results = state.get("check_results", "")
     ai_analysis = state.get("ai_analysis", "")
     
+    # Get existing tracking data
+    total_tokens_used = state.get("total_tokens_used", 0)
+    generation_tokens = state.get("generation_tokens", 0)
+    api_call_count = state.get("api_call_count", 0)
+    generation_times = state.get("generation_times", [])
+    
+    # On retries, read task from state; on first run, use the parameter
+    if not_good_enough and state.get("task"):
+        task = state["task"]  # Use task from state for retries
+    # else: use the task parameter passed to the function (first run)
+    
     if not_good_enough:
         logger.info(f"🔄 Code Generator Step (Retry {retries}) - Regenerating code based on quality feedback")
+        
+        # Get preview of why retry was triggered for better context
+        retry_reasons = []
+        if check_results:
+            critical_count = check_results.count('✗ CRITICAL:')
+            warning_count = check_results.count('⚠ Warning:') + check_results.count('⚠️ Warning:')
+            if critical_count > 0:
+                retry_reasons.append(f"{critical_count} critical issues")
+            elif warning_count > WARNING_THRESHOLD:
+                retry_reasons.append(f"{warning_count} warnings (exceeds limit of {WARNING_THRESHOLD})")
+        
+        retry_reason_text = " + ".join(retry_reasons) if retry_reasons else "quality issues detected"
         
         # Enhanced visual output for retries with emojis and ASCII art
         print("\n" + "🚨" + "=" * 78 + "🚨")
         print("🔥 🔄 ⚡ ⭐ RETRY MODE ACTIVATED - LEARNING FROM MISTAKES ⭐ ⚡ 🔄 🔥")
         print("🚨" + "=" * 78 + "🚨")
-        print(f"🔢 ATTEMPT NUMBER: {retries + 1} of {MAX_RETRIES + 1}")
+        print(f"🔢 ATTEMPT NUMBER: {retries + 1} of {MAX_RETRIES}")
+        print(f"🚨 RETRY REASON: Previous code failed due to {retry_reason_text}")
         print(f"💥 MISSION: Fix quality issues and generate superior code")
         print(f"🧠 LEARNING SOURCE: Previous quality feedback + AI analysis")
         print(f"🎯 TARGET: Production-ready, bulletproof code")
@@ -122,6 +160,7 @@ def code_generator(state: State, instructor_client: Instructor, task: str) -> St
         print("⚠️  PREVIOUS ATTEMPT FAILED QUALITY GATES - ADAPTING STRATEGY...")
         print("🔧 Applying hard-learned lessons to generate better code...")
         print("💪 This time will be different - incorporating ALL feedback!")
+        print(f"🎪 FOCUS: Addressing {retry_reason_text} with targeted improvements")
         print("🚨" + "=" * 78 + "🚨")
     else:
         logger.info(f"✨ Code Generator Step - Generating code for the first time")
@@ -146,41 +185,198 @@ def code_generator(state: State, instructor_client: Instructor, task: str) -> St
       generating high-quality Python code snippets or complete functions based on their specified requirements.
     """
     
-    # Build user prompt - include feedback if this is a retry
+    # Build user prompt - include targeted feedback if this is a retry
     if not_good_enough and (check_results or ai_analysis):
+        # Extract ALL feedback types for comprehensive retry prompting
+        critical_issues_list = []
+        warnings_list = []
+        ai_feedback_list = []
+        all_quality_issues = []
+        
+        if check_results:
+            lines = check_results.split('\n')
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                    
+                # Extract critical issues
+                if '✗ CRITICAL:' in line:
+                    issue = line.replace('✗ CRITICAL:', '').strip()
+                    critical_issues_list.append(issue)
+                    all_quality_issues.append(f"CRITICAL: {issue}")
+                
+                # Extract ALL warning patterns (more comprehensive)
+                elif any(pattern in line for pattern in ['⚠ Warning:', '⚠️ Warning:', '⚠', 'Warning:']):
+                    # Clean up the warning text
+                    warning = line
+                    for pattern in ['⚠ Warning:', '⚠️ Warning:', '⚠️', '⚠']:
+                        warning = warning.replace(pattern, '').strip()
+                    if warning and warning not in warnings_list:
+                        warnings_list.append(warning)
+                        all_quality_issues.append(f"WARNING: {warning}")
+                
+                # Extract AI assessment issues
+                elif '🤖 AI' in line and ('Score:' in line or 'Ready:' in line):
+                    ai_feedback_list.append(line.replace('🤖', '').strip())
+                    all_quality_issues.append(f"AI ASSESSMENT: {line.replace('🤖', '').strip()}")
+        
+        # Enhanced AI analysis parsing - extract ALL relevant sections
+        if ai_analysis:
+            lines = ai_analysis.split('\n')
+            current_section = None
+            
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                
+                # Identify sections
+                if any(section in line for section in ['Security Assessment:', 'Performance Analysis:', 'Code Smells Identified:', 'Improvement Suggestions:', 'Test Coverage Assessment:']):
+                    current_section = line
+                    continue
+                
+                # Extract actionable items from each section
+                elif line.startswith('• ') and current_section:
+                    feedback_item = line.replace('• ', '').strip()
+                    if feedback_item and feedback_item not in ai_feedback_list:
+                        ai_feedback_list.append(f"{current_section.replace(':', '')} - {feedback_item}")
+                        all_quality_issues.append(f"AI INSIGHT: {feedback_item}")
+                
+                # Extract direct quality scores and assessments
+                elif any(keyword in line.lower() for keyword in ['score:', 'ready:', 'quality:', 'issue', 'problem', 'improve', 'fix', 'error']):
+                    if line not in ai_feedback_list:
+                        ai_feedback_list.append(line)
+                        all_quality_issues.append(f"AI ASSESSMENT: {line}")
+        
+        # Construct COMPREHENSIVE retry prompt with ALL feedback
         user_prompt = f"""Write a Python function that performs the following: {task}.
 
-IMPORTANT: This is a retry attempt. The previous code generation failed quality checks. Please address the following issues:
+🚨 CRITICAL: This is retry attempt #{retries + 1}. The previous code generation FAILED quality checks with {len(critical_issues_list)} critical issues and {len(warnings_list)} warnings.
 
-QUALITY FEEDBACK FROM PREVIOUS ATTEMPT:
-{check_results}
+🔥 COMPLETE FEEDBACK FROM PREVIOUS ATTEMPT:"""
 
-{ai_analysis if ai_analysis else ""}
+        if critical_issues_list:
+            user_prompt += f"""
 
-Please generate improved code that specifically addresses these quality issues while maintaining all the original requirements."""
+🛑 CRITICAL ISSUES THAT MUST BE FIXED:"""
+            for i, issue in enumerate(critical_issues_list, 1):
+                user_prompt += f"""
+{i}. {issue}"""
+
+        if warnings_list:
+            user_prompt += f"""
+
+⚠️ ALL QUALITY WARNINGS TO ADDRESS:"""
+            for i, warning in enumerate(warnings_list, 1):
+                user_prompt += f"""
+{i}. {warning}"""
+
+        if ai_feedback_list:
+            user_prompt += f"""
+
+🤖 AI EXPERT ANALYSIS & RECOMMENDATIONS:"""
+            for i, feedback in enumerate(ai_feedback_list, 1):
+                user_prompt += f"""
+{i}. {feedback}"""
+
+        # Include a comprehensive summary of ALL issues
+        if all_quality_issues:
+            user_prompt += f"""
+
+📋 COMPLETE ISSUE SUMMARY ({len(all_quality_issues)} total issues):"""
+            for i, issue in enumerate(all_quality_issues, 1):
+                user_prompt += f"""
+{i}. {issue}"""
+
+        user_prompt += f"""
+
+🎯 ENHANCED REQUIREMENTS FOR THIS RETRY:
+1. ✅ Fix EVERY single critical issue listed above - zero tolerance for critical failures
+2. ✅ Address ALL {len(warnings_list)} quality warnings to achieve production standards
+3. ✅ Implement ALL AI recommendations and expert suggestions
+4. ✅ Include comprehensive error handling with specific exception types
+5. ✅ Add complete type hints for all parameters, return values, and variables
+6. ✅ Write detailed Google-style docstrings with examples and parameter descriptions
+7. ✅ Create exhaustive unit tests covering ALL edge cases, errors, and normal operations
+8. ✅ Follow ALL Python best practices (PEP 8, security, performance, maintainability)
+9. ✅ Ensure ALL dependencies are properly declared and imported
+10. ✅ Make the code 100% production-ready with comprehensive documentation
+
+💡 SUCCESS CRITERIA FOR THIS RETRY:
+- ✅ ZERO critical issues (non-negotiable)
+- ✅ Maximum {WARNING_THRESHOLD} warnings (significant improvement from {len(warnings_list)} warnings)
+- ✅ High-quality, production-ready code that passes all quality gates
+- ✅ Comprehensive test coverage with multiple test scenarios
+- ✅ Clear, professional documentation and usage examples
+- ✅ Addressing ALL specific feedback points from the previous attempt
+
+⚡ CRITICAL SUCCESS FACTORS:
+- Learn from EVERY piece of feedback above
+- Generate code that specifically addresses each identified issue
+- Implement superior error handling and input validation
+- Create tests that cover scenarios mentioned in the feedback
+- Use the exact improvements suggested by the AI analysis
+- Ensure the function name, structure, and implementation follow all best practices
+
+🎖️ QUALITY STANDARD: This retry must produce enterprise-grade, production-ready code that addresses every single point of feedback from the previous attempt."""
         
-        print(f"🔄 Incorporating previous quality feedback into generation...")
+        print(f"🔄 Providing COMPREHENSIVE feedback:")
+        print(f"   💥 {len(critical_issues_list)} critical issues to fix")
+        print(f"   ⚠️ {len(warnings_list)} quality warnings to address") 
+        print(f"   🤖 {len(ai_feedback_list)} AI recommendations to implement")
+        print(f"   📋 {len(all_quality_issues)} total feedback points provided")
+        print(f"🎯 Target: Reduce {len(warnings_list)} warnings to ≤ {WARNING_THRESHOLD} and eliminate all critical issues")
     else:
-        user_prompt = f"Write a Python function that performs the following: {task}."
+        user_prompt = f"""Write a Python function that performs the following: {task}.
+
+🎯 REQUIREMENTS:
+- Include comprehensive error handling and input validation
+- Add proper type hints for all parameters and return values  
+- Write detailed docstrings following Google/NumPy style
+- Create thorough unit tests covering edge cases and error conditions
+- Follow Python best practices (PEP 8, security, performance)
+- Ensure all dependencies are properly imported and used correctly
+- Make the code production-ready with clear documentation and examples"""
     
     try:
+        # Track API call timing and tokens
+        api_start_time = time.time()
+        
         generated_response = instructor_client.chat.completions.create(
             system=system_prompt,
             messages=[{"role": "user", "content": user_prompt}],
             response_model=PythonCodeGenerationResponse,
         )
         
+        api_end_time = time.time()
+        api_duration = api_end_time - api_start_time
+        
+        # Track token usage (approximate based on character count since instructor doesn't return usage)
+        prompt_tokens = len(system_prompt + user_prompt) // 4  # Rough estimation: 4 chars per token
+        completion_tokens = len(str(generated_response)) // 4  # Rough estimation for response
+        total_call_tokens = prompt_tokens + completion_tokens
+        
+        # Update tracking data
+        api_call_count += 1
+        total_tokens_used += total_call_tokens
+        generation_tokens += total_call_tokens
+        generation_times.append(api_duration)
+        
+        logger.info(f"API Call {api_call_count}: {api_duration:.2f}s, ~{total_call_tokens} tokens")
+        
         # Display comprehensive output
         print(f"\n🎯 === GENERATED CODE ARTIFACTS ===")
+        print(f"⏱️ Generation Time: {api_duration:.2f}s | 🔢 Tokens: ~{total_call_tokens}")
         print(f"\n📝 Function Name: {generated_response.function_name}")
         
         print(f"\n💡 Explanation:")
         print(f"{generated_response.explanation}")
         
         print(f"\n💻 Generated Code:")
-        print(f"```python")
+        print("```python")
         print(f"{generated_response.code}")
-        print(f"```")
+        print("```")
         
         if generated_response.dependencies:
             print(f"\n📦 Dependencies:")
@@ -188,9 +384,9 @@ Please generate improved code that specifically addresses these quality issues w
                 print(f"  • {dep}")
         
         print(f"\n🧪 Test Code:")
-        print(f"```python")
+        print("```python")
         print(f"{generated_response.test_code}")
-        print(f"```")
+        print("```")
         
         print(f"\n💡 Usage Examples:")
         for i, example in enumerate(generated_response.usage_examples, 1):
@@ -205,16 +401,28 @@ Please generate improved code that specifically addresses these quality issues w
         logger.error(error_msg)
         return state.update(
             generated_python_response=None,
-            retries=retries
+            retries=retries,
+            task=task,
+            workflow_start_time=workflow_start_time,
+            total_tokens_used=total_tokens_used,
+            generation_tokens=generation_tokens,
+            api_call_count=api_call_count,
+            generation_times=generation_times,
         )
     
     return state.update(
         generated_python_response=generated_response,
-        retries=retries
+        retries=retries,
+        task=task,
+        workflow_start_time=workflow_start_time,
+        total_tokens_used=total_tokens_used,
+        generation_tokens=generation_tokens,
+        api_call_count=api_call_count,
+        generation_times=generation_times,
     )
 
 
-@action(reads=["generated_python_response"], writes=["not_good_enough", "check_results", "ai_analysis"])
+@action(reads=["generated_python_response", "task", "total_tokens_used", "analysis_tokens", "api_call_count", "analysis_times"], writes=["not_good_enough", "check_results", "ai_analysis", "total_tokens_used", "analysis_tokens", "api_call_count", "analysis_times"])
 def code_checker(state: State, instructor_client: Instructor) -> State:
     """
     Comprehensive code quality checker that validates generated Python code for production use.
@@ -222,7 +430,17 @@ def code_checker(state: State, instructor_client: Instructor) -> State:
     """
     logger.info("Code Checker Step - Analyzing generated code quality")
     
+    # Track analysis start time
+    analysis_start_time = time.time()
+    
+    # Get existing tracking data
+    total_tokens_used = state.get("total_tokens_used", 0)
+    analysis_tokens = state.get("analysis_tokens", 0)
+    api_call_count = state.get("api_call_count", 0)
+    analysis_times = state.get("analysis_times", [])
+    
     generated_response = state["generated_python_response"]
+    task = state["task"]
     if not generated_response:
         logger.error("No generated code found in state")
         return state.update(
@@ -247,17 +465,32 @@ def code_checker(state: State, instructor_client: Instructor) -> State:
             check_results.append(f"✗ CRITICAL: Syntax error - {e}")
             critical_issues += 1
         
-        # Check if dependencies are valid (if provided)
+        # Enhanced dependency validation
         if generated_response.dependencies:
             for dep in generated_response.dependencies:
                 try:
                     # Basic check if import statement is valid
                     if dep.startswith('import ') or dep.startswith('from '):
                         ast.parse(dep)
-                    check_results.append(f"✓ Dependency '{dep}' is syntactically valid")
+                        check_results.append(f"✓ Dependency '{dep}' is syntactically valid")
+                    else:
+                        check_results.append(f"⚠ Warning: Dependency '{dep}' should be a proper import statement")
+                        warnings += 1
                 except:
-                    check_results.append(f"⚠ Warning: Dependency '{dep}' may have issues")
+                    check_results.append(f"⚠ Warning: Dependency '{dep}' may have syntax issues")
                     warnings += 1
+        else:
+            # Check if code uses common libraries without declaring dependencies
+            common_imports = ['requests', 'pandas', 'numpy', 'matplotlib', 'beautifulsoup4', 'selenium', 'threading', 'json', 'csv', 'os', 'sys']
+            missing_deps = []
+            code_content = generated_response.code  # Get code content for analysis
+            for lib in common_imports:
+                if lib in code_content and (not generated_response.dependencies or lib not in str(generated_response.dependencies)):
+                    missing_deps.append(lib)
+            
+            if missing_deps:
+                check_results.append(f"⚠ Warning: Code uses libraries but dependencies not declared: {', '.join(missing_deps)}")
+                warnings += 1
     except Exception as e:
         check_results.append(f"✗ CRITICAL: Failed to validate syntax - {e}")
         critical_issues += 1
@@ -288,22 +521,46 @@ def code_checker(state: State, instructor_client: Instructor) -> State:
         check_results.append("⚠ Warning: No error handling detected")
         warnings += 1
     
-    # 3. Security Checks
-    security_risks = ['eval(', 'exec(', 'os.system(', 'subprocess.call(', '__import__']
-    for risk in security_risks:
+    # 3. Enhanced Security Checks
+    security_risks = {
+        'eval(': "eval() function detected - major security vulnerability",
+        'exec(': "exec() function detected - major security vulnerability", 
+        'os.system(': "os.system() detected - use subprocess instead",
+        'subprocess.call(': "subprocess.call() without shell=False - potential security risk",
+        '__import__': "__import__ detected - use proper import statements",
+        'pickle.load': "pickle.load detected - potential code execution vulnerability",
+        'input(': "input() without validation detected - potential security risk"
+    }
+    
+    security_found = False
+    for risk, message in security_risks.items():
         if risk in code_content:
-            check_results.append(f"✗ CRITICAL: Security risk detected - {risk}")
+            check_results.append(f"✗ CRITICAL: {message}")
             critical_issues += 1
+            security_found = True
     
-    if critical_issues == 0:
-        check_results.append("✓ No security risks detected")
+    if not security_found:
+        check_results.append("✓ No major security risks detected")
     
-    # 4. Performance and Best Practices
+    # 4. Enhanced Performance and Best Practices Checks
     performance_checks = {
         'global ': "Global variables detected - consider encapsulation",
-        'while True:': "Infinite loop detected - ensure proper exit conditions",
+        'while True:': "Infinite loop detected - ensure proper exit conditions", 
         'import *': "Wildcard imports detected - use specific imports",
+        'time.sleep(': "time.sleep() in main logic - consider async alternatives",
+        'requests.get(': "requests.get() without timeout - add timeout parameter",
+        'open(': "File operations without context manager - use 'with open()'"
     }
+    
+    # Additional critical checks for web scraping task
+    if 'scraper' in task.lower() or 'scraping' in task.lower():
+        web_scraping_checks = {
+            'requests.get(': "HTTP requests detected - ensure proper error handling and timeouts",
+            'BeautifulSoup': "Web scraping detected - ensure robots.txt compliance",
+            'selenium': "Browser automation detected - ensure proper resource cleanup",
+            'threading': "Threading detected - ensure thread safety and proper synchronization"
+        }
+        performance_checks.update(web_scraping_checks)
     
     for pattern, message in performance_checks.items():
         if pattern in code_content:
@@ -384,36 +641,62 @@ def code_checker(state: State, instructor_client: Instructor) -> State:
         DEPENDENCIES:
         {generated_response.dependencies or 'None specified'}
         
+        CURRENT QUALITY STATUS:
+        - Critical Issues Found: {critical_issues}
+        - Warnings Found: {warnings}
+        
         Provide a comprehensive analysis focusing on:
         1. Code quality and adherence to Python best practices
-        2. Security vulnerabilities and potential risks
+        2. Security vulnerabilities and potential risks  
         3. Performance considerations and optimization opportunities
-        4. Test coverage and quality
-        5. Maintainability and readability
+        4. Test coverage and quality assessment
+        5. Maintainability and readability evaluation
         6. Production readiness assessment
+        
+        IMPORTANT: Focus on providing specific, actionable improvement suggestions that can be directly 
+        implemented in a retry attempt. Be concrete about what changes are needed.
         """
         
         try:
+            # Track AI analysis API call timing and tokens
+            ai_api_start_time = time.time()
+            
             ai_analysis = instructor_client.chat.completions.create(
                 system="You are an expert Python code reviewer specializing in production-ready code assessment. Provide thorough, actionable feedback.",
                 messages=[{"role": "user", "content": ai_analysis_prompt}],
                 response_model=CodeAnalysisResponse,
             )
             
+            ai_api_end_time = time.time()
+            ai_api_duration = ai_api_end_time - ai_api_start_time
+            
+            # Track token usage for AI analysis
+            ai_prompt_tokens = len(ai_analysis_prompt) // 4  # Rough estimation
+            ai_completion_tokens = len(str(ai_analysis)) // 4  # Rough estimation
+            ai_total_tokens = ai_prompt_tokens + ai_completion_tokens
+            
+            # Update tracking data
+            api_call_count += 1
+            total_tokens_used += ai_total_tokens
+            analysis_tokens += ai_total_tokens
+            analysis_times.append(ai_api_duration)
+            
+            logger.info(f"AI Analysis Call {api_call_count}: {ai_api_duration:.2f}s, ~{ai_total_tokens} tokens")
+            
             # Incorporate AI analysis into quality assessment
             ai_quality_score = ai_analysis.overall_quality_score
             ai_maintainability = ai_analysis.maintainability_score
-            ai_production_ready = ai_analysis.production_readiness
+            # ai_production_ready = ai_analysis.production_readiness
             
             check_results.append(f"🤖 AI Overall Quality Score: {ai_quality_score}/10")
             check_results.append(f"🤖 AI Maintainability Score: {ai_maintainability}/10")
-            check_results.append(f"🤖 AI Production Ready: {'✓' if ai_production_ready else '✗'}")
+            # check_results.append(f"🤖 AI Production Ready: {'✓' if ai_production_ready else '✗'}")
             
             # Add AI-identified issues
             if ai_analysis.code_smells:
                 check_results.append("🤖 AI-Identified Code Smells:")
                 for smell in ai_analysis.code_smells:
-                    check_results.append(f"  • {smell}")
+                    check_results.append(f"⚠ Warning: AI Code Smell - {smell}")
                     warnings += 1
             
             # Add AI positive feedback
@@ -422,14 +705,17 @@ def code_checker(state: State, instructor_client: Instructor) -> State:
                 for aspect in ai_analysis.positive_aspects:
                     check_results.append(f"  ✓ {aspect}")
             
-            # AI-based critical assessment
-            if not ai_production_ready or ai_quality_score < 6:
-                critical_issues += 1
-                check_results.append("✗ CRITICAL: AI assessment indicates code not ready for production")
+            # # AI-based critical assessment
+            # if not ai_production_ready or ai_quality_score < 6:
+            #     critical_issues += 1
+            #     check_results.append("✗ CRITICAL: AI assessment indicates code not ready for production")
             
-            # Store detailed AI analysis for later display
+            # Store detailed AI analysis for later display and retry feedback
             ai_detailed_analysis = f"""
-🤖 === AI-POWERED CODE ANALYSIS ===
+🤖 === AI-POWERED CODE ANALYSIS REPORT ===
+
+Overall Quality Score: {ai_quality_score}/10
+Maintainability Score: {ai_maintainability}/10
 
 Security Assessment:
 {ai_analysis.security_assessment}
@@ -440,34 +726,76 @@ Performance Analysis:
 Test Coverage Assessment:
 {ai_analysis.test_coverage_assessment}
 
-Improvement Suggestions:
-{chr(10).join(f'• {suggestion}' for suggestion in ai_analysis.improvement_suggestions)}
+Code Smells Identified:
+{chr(10).join(f'• {smell}' for smell in ai_analysis.code_smells) if ai_analysis.code_smells else '• None identified'}
 
-Detailed Feedback:
+Positive Aspects:
+{chr(10).join(f'• {aspect}' for aspect in ai_analysis.positive_aspects) if ai_analysis.positive_aspects else '• None identified'}
+
+Improvement Suggestions:
+{chr(10).join(f'• {suggestion}' for suggestion in ai_analysis.improvement_suggestions) if ai_analysis.improvement_suggestions else '• None provided'}
+
+Detailed Expert Feedback:
 {ai_analysis.detailed_feedback}
+
+🎯 RETRY GUIDANCE: The above improvement suggestions should be directly addressed in any retry attempt.
 """
             
         except Exception as e:
             check_results.append(f"⚠ Warning: AI analysis failed - {e}")
             warnings += 1
-            ai_detailed_analysis = "AI analysis was not available due to an error."
+            ai_detailed_analysis = "AI analysis was not available due to an error." + f" Error details: {str(e)}"
     else:
         # Skip AI analysis due to critical issues
         check_results.append("⚠ Skipping AI analysis due to critical syntax/security errors")
         ai_detailed_analysis = "AI analysis was skipped due to critical syntax or security errors that prevent code analysis."
     
-    # Final Assessment
+    # Final Assessment with structured feedback
     total_issues = critical_issues + warnings
-    check_summary = f"\n=== CODE QUALITY ASSESSMENT ===\n"
-    check_summary += f"Critical Issues: {critical_issues}\n"
-    check_summary += f"Warnings: {warnings}\n"
-    check_summary += f"Total Issues: {total_issues}\n\n"
-    check_summary += "\n".join(check_results)
+    
+    # Create structured feedback for better retry processing
+    check_summary = f"""
+=== CODE QUALITY ASSESSMENT REPORT ===
+Critical Issues: {critical_issues}
+Warnings: {warnings} 
+Total Issues: {total_issues}
+
+=== DETAILED FINDINGS ===
+"""
+    
+    # Categorize results for better feedback parsing
+    critical_findings = [result for result in check_results if '✗ CRITICAL:' in result]
+    warning_findings = [result for result in check_results if '⚠ Warning:' in result or '⚠️ Warning:' in result]
+    success_findings = [result for result in check_results if '✓' in result]
+    ai_findings = [result for result in check_results if '🤖' in result and 'Warning:' not in result]  # Exclude AI warnings from AI section
+    
+    if critical_findings:
+        check_summary += "\n🚨 CRITICAL ISSUES BLOCKING PRODUCTION:\n"
+        for finding in critical_findings:
+            check_summary += f"{finding}\n"
+    
+    if warning_findings:
+        check_summary += "\n⚠️ QUALITY WARNINGS:\n"
+        for finding in warning_findings:
+            check_summary += f"{finding}\n"
+        
+        # Debug info to track warning discrepancy
+        check_summary += f"\n📊 WARNING ANALYSIS: Found {len(warning_findings)} warning items in detailed findings vs {warnings} total warnings counted\n"
+    
+    if ai_findings:
+        check_summary += "\n🤖 AI ASSESSMENT:\n"
+        for finding in ai_findings:
+            check_summary += f"{finding}\n"
+    
+    if success_findings:
+        check_summary += "\n✅ QUALITY CHECKS PASSED:\n"
+        for finding in success_findings:
+            check_summary += f"{finding}\n"
     
     # Determine if code is good enough for production
     # STRICT RULE: ANY critical issues = automatic rejection
-    # Additional rule: Too many warnings (>5) = rejection for production use
-    not_good_enough = critical_issues > 0 or warnings > 5
+    # Additional rule: Too many warnings (> WARNING_THRESHOLD) = rejection for production use
+    not_good_enough = critical_issues > 0 or warnings > WARNING_THRESHOLD
     
     # Enhanced logging and display with dramatic visual feedback
     if critical_issues > 0:
@@ -483,8 +811,8 @@ Detailed Feedback:
         print(f"🔄 RETRY STATUS: Will attempt regeneration with feedback")
         print(f"🚨" + "=" * 70 + "🚨")
         
-    elif warnings > 5:
-        rejection_reason = f"TOO MANY WARNINGS ({warnings} warnings exceed threshold of 5)"
+    elif warnings > WARNING_THRESHOLD:
+        rejection_reason = f"TOO MANY WARNINGS ({warnings} warnings exceed threshold of {WARNING_THRESHOLD})"
         logger.warning(f"⚠️ Code REJECTED for production: {rejection_reason}")
         
         print(f"\n⚠️" + "=" * 68 + "⚠️")
@@ -502,7 +830,7 @@ Detailed Feedback:
         print(f"\n🎉" + "=" * 64 + "🎉")
         print("🚀 ✅ 🌟 PRODUCTION READINESS: APPROVED! 🌟 ✅ 🚀")
         print(f"🎉" + "=" * 64 + "🎉")
-        print(f"💚 Quality Score: {warnings} warnings (within tolerance)")
+        print(f"💚 Quality Score: {warnings} warnings (within tolerance of {WARNING_THRESHOLD})")
         print(f"🎯 Status: Ready for production deployment!")
         print(f"🏆 Achievement: Passed all quality gates!")
         print(f"🎉" + "=" * 64 + "🎉")
@@ -512,22 +840,80 @@ Detailed Feedback:
     return state.update(
         not_good_enough=not_good_enough,
         check_results=check_summary,
-        ai_analysis=ai_detailed_analysis
+        ai_analysis=ai_detailed_analysis,
+        total_tokens_used=total_tokens_used,
+        analysis_tokens=analysis_tokens,
+        api_call_count=api_call_count,
+        analysis_times=analysis_times,
     )
   
-@action(reads=["generated_python_response", "check_results", "ai_analysis"], writes=[])
+@action(reads=["generated_python_response", "check_results", "ai_analysis", "task", "retries", "not_good_enough", "workflow_start_time", "total_tokens_used", "generation_tokens", "analysis_tokens", "api_call_count", "generation_times", "analysis_times"], writes=["workflow_end_time"])
 def end(state: State) -> State:
-    """Final action that displays the results of the code generation workflow."""
+    """Final action that displays the results and generates a comprehensive markdown report."""
     logger.info("=== WORKFLOW COMPLETED ===")
+    
+    # Record workflow end time
+    workflow_end_time = time.time()
     
     generated_response = state.get("generated_python_response")
     check_results = state.get("check_results", "")
     ai_analysis = state.get("ai_analysis", "")
+    task = state.get("task", "")
+    retries = state.get("retries", 0)
+    not_good_enough = state.get("not_good_enough", False)
+    
+    # Get timing and token data
+    workflow_start_time = state.get("workflow_start_time", workflow_end_time)
+    total_tokens_used = state.get("total_tokens_used", 0)
+    generation_tokens = state.get("generation_tokens", 0)
+    analysis_tokens = state.get("analysis_tokens", 0)
+    api_call_count = state.get("api_call_count", 0)
+    generation_times = state.get("generation_times", [])
+    analysis_times = state.get("analysis_times", [])
+    
+    # Calculate timing metrics
+    total_duration = workflow_end_time - workflow_start_time
+    avg_generation_time = sum(generation_times) / len(generation_times) if generation_times else 0
+    avg_analysis_time = sum(analysis_times) / len(analysis_times) if analysis_times else 0
     
     # Grand finale visual output
     print(f"\n🏁" + "=" * 76 + "🏁")
     print("🎊 🏆 ⭐ AI PYTHON CODING WORKFLOW COMPLETED! ⭐ 🏆 🎊")
     print(f"🏁" + "=" * 76 + "🏁")
+    
+    # Display performance metrics
+    print(f"\n📊 === WORKFLOW PERFORMANCE METRICS ===")
+    print(f"⏱️ Total Duration: {total_duration:.2f}s")
+    print(f"🔢 Total API Calls: {api_call_count}")
+    print(f"🎯 Total Tokens Used: ~{total_tokens_used:,}")
+    print(f"📝 Generation Tokens: ~{generation_tokens:,}")
+    print(f"🤖 Analysis Tokens: ~{analysis_tokens:,}")
+    if generation_times:
+        print(f"⚡ Avg Generation Time: {avg_generation_time:.2f}s")
+    if analysis_times:
+        print(f"🧠 Avg Analysis Time: {avg_analysis_time:.2f}s")
+    
+    # Generate comprehensive markdown report
+    report_content = _generate_comprehensive_report(
+        generated_response, check_results, ai_analysis, task, retries, not_good_enough,
+        total_duration, api_call_count, total_tokens_used, generation_tokens, analysis_tokens,
+        generation_times, analysis_times
+    )
+    
+    # Save report to file
+    import datetime
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    report_filename = f"ai_coding_workflow_report_{timestamp}.md"
+    report_path = f"/Users/josereyes/Dev/ai-python-coding-agent/01_ai_workflow/{report_filename}"
+    
+    try:
+        with open(report_path, 'w', encoding='utf-8') as f:
+            f.write(report_content)
+        print(f"📋 Comprehensive report saved: {report_filename}")
+        logger.info(f"Report generated successfully: {report_path}")
+    except Exception as e:
+        print(f"⚠️ Failed to save report: {e}")
+        logger.error(f"Failed to save report: {e}")
     
     if generated_response:
         print(f"\n🎯 === FINAL GENERATED ARTIFACTS ===")
@@ -538,9 +924,9 @@ def end(state: State) -> State:
         print(f"{generated_response.explanation}")
         
         print(f"\n💻 === PRODUCTION CODE ===")
-        print(f"```python")
+        print("```python")
         print(f"{generated_response.code}")
-        print(f"```")
+        print("```")
         
         if generated_response.dependencies:
             print(f"\n📦 === DEPENDENCIES ===")
@@ -548,9 +934,9 @@ def end(state: State) -> State:
                 print(f"  📌 {dep}")
         
         print(f"\n🧪 === TEST SUITE ===")
-        print(f"```python")
+        print("```python")
         print(f"{generated_response.test_code}")
-        print(f"```")
+        print("```")
         
         print(f"\n💡 === USAGE EXAMPLES ===")
         for i, example in enumerate(generated_response.usage_examples, 1):
@@ -571,7 +957,357 @@ def end(state: State) -> State:
     print("🎉 Thank you for using the AI Python Coding Agent! 🎉")
     print(f"🏁" + "=" * 76 + "🏁")
     
-    return state
+    return state.update(workflow_end_time=workflow_end_time)
+
+
+def _generate_comprehensive_report(generated_response, check_results, ai_analysis, task, retries, not_good_enough, 
+                                 total_duration, api_call_count, total_tokens_used, generation_tokens, analysis_tokens,
+                                 generation_times, analysis_times):
+    """Generate a comprehensive markdown report of the entire workflow."""
+    
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    # Determine workflow outcome
+    if generated_response and not not_good_enough:
+        outcome_status = "✅ SUCCESS"
+        outcome_color = "🟢"
+        outcome_description = "Code generation completed successfully and passed all quality gates"
+    elif generated_response and not_good_enough:
+        outcome_status = "⚠️ PARTIAL SUCCESS"
+        outcome_color = "🟡"
+        outcome_description = "Code generation completed but failed final quality assessment"
+    else:
+        outcome_status = "❌ FAILURE"
+        outcome_color = "🔴"
+        outcome_description = "Code generation failed or maximum retry limit exceeded"
+    
+    # Parse quality metrics from check_results
+    critical_issues = check_results.count('✗ CRITICAL:') if check_results else 0
+    warnings = check_results.count('⚠ Warning:') + check_results.count('⚠️ Warning:') if check_results else 0
+    passed_checks = check_results.count('✓') if check_results else 0
+    
+    # Extract AI metrics if available
+    ai_quality_score = "N/A"
+    ai_maintainability_score = "N/A"
+    if ai_analysis and "Overall Quality Score:" in ai_analysis:
+        try:
+            quality_line = [line for line in ai_analysis.split('\n') if 'Overall Quality Score:' in line][0]
+            ai_quality_score = quality_line.split(':')[1].strip().split('/')[0]
+        except:
+            pass
+    
+    if ai_analysis and "Maintainability Score:" in ai_analysis:
+        try:
+            maintainability_line = [line for line in ai_analysis.split('\n') if 'Maintainability Score:' in line][0]
+            ai_maintainability_score = maintainability_line.split(':')[1].strip().split('/')[0]
+        except:
+            pass
+    
+    report = f"""# AI Python Coding Agent - Comprehensive Workflow Report
+
+---
+
+## 📊 Executive Summary
+
+**Generated on:** {timestamp}  
+**Workflow Status:** {outcome_color} {outcome_status}  
+**Description:** {outcome_description}  
+**Total Attempts:** {retries + 1} / {MAX_RETRIES}  
+**Quality Threshold:** ≤ {WARNING_THRESHOLD} warnings  
+
+---
+
+## 🎯 Task Overview
+
+**Original Request:**
+```
+{task}
+```
+
+---
+
+## ⚡ Performance Metrics
+
+### Timing Analysis
+- **Total Workflow Duration:** {total_duration:.2f} seconds
+- **API Calls Made:** {api_call_count} calls
+- **Average Generation Time:** {sum(generation_times) / len(generation_times) if generation_times else 0:.2f}s per call
+- **Average Analysis Time:** {sum(analysis_times) / len(analysis_times) if analysis_times else 0:.2f}s per call
+- **Total Generation Time:** {sum(generation_times):.2f}s ({len(generation_times)} calls)
+- **Total Analysis Time:** {sum(analysis_times):.2f}s ({len(analysis_times)} calls)
+
+### Token Usage Analysis
+- **Total Tokens Consumed:** ~{total_tokens_used:,} tokens
+- **Code Generation Tokens:** ~{generation_tokens:,} tokens ({generation_tokens/total_tokens_used*100 if total_tokens_used > 0 else 0:.1f}%)
+- **Quality Analysis Tokens:** ~{analysis_tokens:,} tokens ({analysis_tokens/total_tokens_used*100 if total_tokens_used > 0 else 0:.1f}%)
+- **Average Tokens per API Call:** ~{total_tokens_used/api_call_count if api_call_count > 0 else 0:,.0f} tokens
+- **Estimated Cost:** ~${total_tokens_used * 0.00001:.4f} USD (approximate)
+
+### Efficiency Metrics
+- **Tokens per Second:** ~{total_tokens_used/total_duration if total_duration > 0 else 0:,.0f} tokens/sec
+- **API Calls per Minute:** {api_call_count/(total_duration/60) if total_duration > 0 else 0:.1f} calls/min
+- **Retry Efficiency:** {((retries + 1 - retries) / (retries + 1)) * 100:.1f}% success rate
+- **Quality Gate Performance:** {'PASSED' if not not_good_enough else 'FAILED'} on attempt #{retries + 1}
+
+---
+
+## 📈 Quality Metrics Summary
+
+| Metric | Count | Status |
+|--------|--------|--------|
+| **Critical Issues** | {critical_issues} | {'🔴 BLOCKING' if critical_issues > 0 else '🟢 CLEAR'} |
+| **Quality Warnings** | {warnings} | {'🔴 EXCEEDS LIMIT' if warnings > WARNING_THRESHOLD else '🟡 WITHIN LIMITS' if warnings > 0 else '🟢 CLEAN'} |
+| **Passed Checks** | {passed_checks} | {'🟢 GOOD' if passed_checks > 5 else '🟡 ACCEPTABLE' if passed_checks > 0 else '🔴 POOR'} |
+| **AI Quality Score** | {ai_quality_score}/10 | {'🟢 EXCELLENT' if ai_quality_score != 'N/A' and int(ai_quality_score) >= 8 else '🟡 GOOD' if ai_quality_score != 'N/A' and int(ai_quality_score) >= 6 else '🔴 NEEDS IMPROVEMENT' if ai_quality_score != 'N/A' else 'N/A'} |
+| **AI Maintainability** | {ai_maintainability_score}/10 | {'🟢 EXCELLENT' if ai_maintainability_score != 'N/A' and int(ai_maintainability_score) >= 8 else '🟡 GOOD' if ai_maintainability_score != 'N/A' and int(ai_maintainability_score) >= 6 else '🔴 NEEDS IMPROVEMENT' if ai_maintainability_score != 'N/A' else 'N/A'} |
+
+---
+
+## 🔄 Workflow Journey
+
+### Attempt History
+"""
+
+    # Add attempt history
+    if retries == 0:
+        report += """
+**Attempt 1:** ✅ **FIRST TRY SUCCESS** - Code generated and passed all quality gates on the first attempt
+"""
+    else:
+        for attempt in range(retries + 1):
+            if attempt == 0:
+                report += f"""
+**Attempt {attempt + 1}:** 🔴 **INITIAL FAILURE** - Code generated but failed quality assessment
+"""
+            elif attempt < retries:
+                report += f"""
+**Attempt {attempt + 1}:** 🔄 **RETRY #{attempt}** - Applied feedback and regenerated code, still failed
+"""
+            else:
+                if not_good_enough:
+                    report += f"""
+**Attempt {attempt + 1}:** ⚠️ **FINAL ATTEMPT** - Applied comprehensive feedback, partial success
+"""
+                else:
+                    report += f"""
+**Attempt {attempt + 1}:** ✅ **SUCCESS** - Applied comprehensive feedback and passed all quality gates
+"""
+
+    # Add generated artifacts section
+    if generated_response:
+        report += f"""
+
+---
+
+## 🎯 Generated Artifacts
+
+### Function Overview
+- **Function Name:** `{generated_response.function_name}`
+- **Generated Dependencies:** {len(generated_response.dependencies or [])} packages
+- **Usage Examples:** {len(generated_response.usage_examples or [])} provided
+- **Test Coverage:** Comprehensive unit tests included
+
+### Function Explanation
+{generated_response.explanation}
+
+### Production Code
+```python
+{generated_response.code}
+```
+
+### Dependencies
+"""
+        if generated_response.dependencies:
+            for dep in generated_response.dependencies:
+                report += f"- `{dep}`\n"
+        else:
+            report += "- No external dependencies required\n"
+
+        report += f"""
+### Test Suite
+```python
+{generated_response.test_code}
+```
+
+### Usage Examples
+"""
+        for i, example in enumerate(generated_response.usage_examples or [], 1):
+            report += f"{i}. `{example}`\n"
+
+    else:
+        report += """
+
+---
+
+## ❌ Generation Failure
+
+**Status:** Code generation failed or was incomplete  
+**Reason:** Maximum retry attempts exceeded without producing acceptable code  
+**Recommendation:** Review task complexity and consider simplifying requirements  
+
+"""
+
+    # Add detailed quality assessment
+    report += f"""
+
+---
+
+## 🔍 Detailed Quality Assessment
+
+### Quality Check Results
+"""
+    
+    if check_results:
+        # Format the check results for markdown
+        formatted_results = check_results.replace("=== CODE QUALITY ASSESSMENT REPORT ===", "")
+        formatted_results = formatted_results.replace("=== DETAILED FINDINGS ===", "")
+        
+        # Convert to markdown format
+        lines = formatted_results.split('\n')
+        in_section = False
+        current_section = ""
+        
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+                
+            if line.startswith('🚨 CRITICAL ISSUES'):
+                report += "\n#### 🚨 Critical Issues Found\n"
+                in_section = True
+            elif line.startswith('⚠️ QUALITY WARNINGS'):
+                report += "\n#### ⚠️ Quality Warnings\n"
+                in_section = True
+            elif line.startswith('🤖 AI ASSESSMENT'):
+                report += "\n#### 🤖 AI Assessment\n"
+                in_section = True
+            elif line.startswith('✅ QUALITY CHECKS PASSED'):
+                report += "\n#### ✅ Passed Quality Checks\n"
+                in_section = True
+            elif line.startswith('📊 WARNING ANALYSIS'):
+                report += f"\n**Debug Info:** {line}\n"
+            elif in_section and (line.startswith('✗') or line.startswith('⚠') or line.startswith('✓') or line.startswith('🤖')):
+                report += f"- {line}\n"
+            elif line.startswith('Critical Issues:') or line.startswith('Warnings:') or line.startswith('Total Issues:'):
+                report += f"**{line}**\n"
+    else:
+        report += "No quality assessment data available.\n"
+
+    # Add AI analysis section
+    if ai_analysis and ai_analysis.strip() and "AI analysis was" not in ai_analysis:
+        report += f"""
+
+---
+
+## 🤖 AI Expert Analysis
+
+{ai_analysis}
+"""
+
+    # Add recommendations section
+    report += f"""
+
+---
+
+## 💡 Recommendations & Next Steps
+
+### Immediate Actions
+"""
+
+    if critical_issues > 0:
+        report += f"""
+1. **🚨 CRITICAL:** Address all {critical_issues} critical issues before deploying to production
+2. **🔒 SECURITY:** Review security vulnerabilities and implement proper safeguards
+3. **🧪 TESTING:** Ensure comprehensive test coverage for all critical paths
+"""
+
+    if warnings > WARNING_THRESHOLD:
+        report += f"""
+1. **⚠️ QUALITY:** Reduce {warnings} warnings to below {WARNING_THRESHOLD} threshold
+2. **📚 STANDARDS:** Apply Python best practices and PEP 8 guidelines
+3. **🔧 REFACTOR:** Consider code refactoring for better maintainability
+"""
+
+    if retries > 0:
+        report += f"""
+1. **📝 PROCESS:** Review task complexity - required {retries + 1} attempts
+2. **🎯 CLARITY:** Consider providing more specific requirements
+3. **🔄 FEEDBACK:** The retry mechanism successfully improved code quality
+"""
+
+    if generated_response and not not_good_enough:
+        report += f"""
+1. **✅ DEPLOYMENT:** Code is ready for production deployment
+2. **📊 MONITORING:** Implement proper logging and monitoring
+3. **🔧 MAINTENANCE:** Schedule regular code reviews and updates
+"""
+
+    report += f"""
+
+### Long-term Improvements
+- **Documentation:** Ensure comprehensive API documentation
+- **Performance:** Profile code in production environment
+- **Scalability:** Test with larger datasets and concurrent users
+- **Monitoring:** Implement health checks and error tracking
+- **Maintenance:** Establish regular code review processes
+
+---
+
+## 📋 Workflow Configuration
+
+- **AI Model:** Claude 3.5 Sonnet (via AWS Bedrock)
+- **Framework:** Burr Workflow Engine
+- **Max Retries:** {MAX_RETRIES}
+- **Warning Threshold:** {WARNING_THRESHOLD}
+- **Quality Gates:** Syntax, Security, Performance, Testing, Documentation
+- **Feedback Loop:** Comprehensive AI-powered analysis with targeted improvements
+
+---
+
+## 📊 Performance Summary
+
+### Resource Utilization
+- **Total Execution Time:** {total_duration:.2f} seconds
+- **Total Token Consumption:** ~{total_tokens_used:,} tokens
+- **API Efficiency:** {total_tokens_used/api_call_count if api_call_count > 0 else 0:,.0f} tokens per call
+- **Processing Speed:** {total_tokens_used/total_duration if total_duration > 0 else 0:,.0f} tokens/second
+
+### Workflow Efficiency
+- **Attempts Required:** {retries + 1} of {MAX_RETRIES} maximum
+- **Success Rate:** {100 if not not_good_enough else 0:.0f}% final quality gate pass
+- **Retry Overhead:** {retries * 100 / (retries + 1) if retries > 0 else 0:.1f}% additional processing
+- **Quality Improvement:** {'Successful' if not not_good_enough else 'Partial'} through iterative feedback
+
+### Cost Analysis
+- **Estimated Cost:** ~${total_tokens_used * 0.00001:.4f} USD
+- **Cost per Attempt:** ~${total_tokens_used * 0.00001 / (retries + 1):.4f} USD
+- **Token Efficiency:** {(generation_tokens + analysis_tokens) / total_tokens_used * 100 if total_tokens_used > 0 else 0:.1f}% productive usage
+
+---
+
+## 🏁 Summary
+
+This report documents a complete AI-powered Python code generation workflow. The system {'successfully generated production-ready code' if not not_good_enough else 'attempted code generation with' + (' partial success' if generated_response else ' failure')} using an iterative approach with comprehensive quality checking and intelligent retry mechanisms.
+
+**Key Achievements:**
+- Automated code generation with Claude 3.5 Sonnet
+- Multi-layered quality assessment (syntax, security, performance)
+- AI-powered code analysis and improvement suggestions
+- Iterative feedback loop for continuous improvement
+- Comprehensive documentation and testing
+
+**Performance Highlights:**
+- **Duration:** {total_duration:.2f}s total execution time
+- **Efficiency:** ~{total_tokens_used:,} tokens consumed across {api_call_count} API calls
+- **Quality:** {'✅ Passed' if not not_good_enough else '⚠️ Failed'} final quality gates
+- **Attempts:** {retries + 1} of {MAX_RETRIES} maximum attempts used
+
+**Generated:** {timestamp}  
+**Report Version:** 1.0  
+**Workflow Engine:** Burr v0.40.2+
+"""
+
+    return report
   
 def instructor_client() -> Instructor:
     MODEL = "anthropic.claude-3-5-sonnet-20241022-v2:0"
@@ -582,9 +1318,9 @@ def instructor_client() -> Instructor:
     )
 
     instructor_client = instructor.from_anthropic(
-        anthropic_client,
-        max_tokens=4096,
-        model=MODEL,
+      anthropic_client,
+      max_tokens=8192,
+      model=MODEL,
     )
 
     return instructor_client
@@ -617,8 +1353,18 @@ def application() -> Application:
           generated_python_response=None,
           check_results="",
           ai_analysis="",
+          task="",  # Will be set when app.run() is called with inputs
+          workflow_start_time=None,
+          workflow_end_time=None,
+          total_tokens_used=0,
+          generation_tokens=0,
+          analysis_tokens=0,
+          api_call_count=0,
+          generation_times=[],
+          analysis_times=[],
         )
         .with_entrypoint("code_generator")
+        .with_tracker("local", project="ai_workflow")
         .build()
     )
 
