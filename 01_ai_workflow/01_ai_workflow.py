@@ -18,8 +18,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Configuration constants
 MAX_RETRIES = 5
 WARNING_THRESHOLD = 5
+ENABLE_AI_ANALYSIS = False  # Set to False to disable AI analysis step
 
 class CodeAnalysisResponse(BaseModel):
     """AI-powered code analysis response with detailed quality assessment."""
@@ -216,13 +218,13 @@ def code_generator(state: State, instructor_client: Instructor, task: str) -> St
                         warnings_list.append(warning)
                         all_quality_issues.append(f"WARNING: {warning}")
                 
-                # Extract AI assessment issues
-                elif '🤖 AI' in line and ('Score:' in line or 'Ready:' in line):
+                # Extract AI assessment issues (only if AI analysis is enabled)
+                elif ENABLE_AI_ANALYSIS and '🤖 AI' in line and ('Score:' in line or 'Ready:' in line):
                     ai_feedback_list.append(line.replace('🤖', '').strip())
                     all_quality_issues.append(f"AI ASSESSMENT: {line.replace('🤖', '').strip()}")
         
-        # Enhanced AI analysis parsing - extract ALL relevant sections
-        if ai_analysis:
+        # Enhanced AI analysis parsing - extract ALL relevant sections (only if AI analysis is enabled)
+        if ENABLE_AI_ANALYSIS and ai_analysis:
             lines = ai_analysis.split('\n')
             current_section = None
             
@@ -272,7 +274,7 @@ def code_generator(state: State, instructor_client: Instructor, task: str) -> St
                 user_prompt += f"""
 {i}. {warning}"""
 
-        if ai_feedback_list:
+        if ai_feedback_list and ENABLE_AI_ANALYSIS:
             user_prompt += f"""
 
 🤖 AI EXPERT ANALYSIS & RECOMMENDATIONS:"""
@@ -293,15 +295,21 @@ def code_generator(state: State, instructor_client: Instructor, task: str) -> St
 
 🎯 ENHANCED REQUIREMENTS FOR THIS RETRY:
 1. ✅ Fix EVERY single critical issue listed above - zero tolerance for critical failures
-2. ✅ Address ALL {len(warnings_list)} quality warnings to achieve production standards
-3. ✅ Implement ALL AI recommendations and expert suggestions
-4. ✅ Include comprehensive error handling with specific exception types
-5. ✅ Add complete type hints for all parameters, return values, and variables
-6. ✅ Write detailed Google-style docstrings with examples and parameter descriptions
-7. ✅ Create exhaustive unit tests covering ALL edge cases, errors, and normal operations
-8. ✅ Follow ALL Python best practices (PEP 8, security, performance, maintainability)
-9. ✅ Ensure ALL dependencies are properly declared and imported
-10. ✅ Make the code 100% production-ready with comprehensive documentation
+2. ✅ Address ALL {len(warnings_list)} quality warnings to achieve production standards"""
+        
+        if ENABLE_AI_ANALYSIS:
+            user_prompt += """
+3. ✅ Implement ALL AI recommendations and expert suggestions"""
+            
+        ai_offset = 1 if ENABLE_AI_ANALYSIS else 0
+        user_prompt += f"""
+{3 + ai_offset}. ✅ Include comprehensive error handling with specific exception types
+{4 + ai_offset}. ✅ Add complete type hints for all parameters, return values, and variables
+{5 + ai_offset}. ✅ Write detailed Google-style docstrings with examples and parameter descriptions
+{6 + ai_offset}. ✅ Create exhaustive unit tests covering ALL edge cases, errors, and normal operations
+{7 + ai_offset}. ✅ Follow ALL Python best practices (PEP 8, security, performance, maintainability)
+{8 + ai_offset}. ✅ Ensure ALL dependencies are properly declared and imported
+{9 + ai_offset}. ✅ Make the code 100% production-ready with comprehensive documentation
 
 💡 SUCCESS CRITERIA FOR THIS RETRY:
 - ✅ ZERO critical issues (non-negotiable)
@@ -315,16 +323,22 @@ def code_generator(state: State, instructor_client: Instructor, task: str) -> St
 - Learn from EVERY piece of feedback above
 - Generate code that specifically addresses each identified issue
 - Implement superior error handling and input validation
-- Create tests that cover scenarios mentioned in the feedback
-- Use the exact improvements suggested by the AI analysis
+- Create tests that cover scenarios mentioned in the feedback"""
+        
+        if ENABLE_AI_ANALYSIS:
+            user_prompt += """
+- Use the exact improvements suggested by the AI analysis"""
+            
+        user_prompt += """
 - Ensure the function name, structure, and implementation follow all best practices
 
 🎖️ QUALITY STANDARD: This retry must produce enterprise-grade, production-ready code that addresses every single point of feedback from the previous attempt."""
         
         print(f"🔄 Providing COMPREHENSIVE feedback:")
         print(f"   💥 {len(critical_issues_list)} critical issues to fix")
-        print(f"   ⚠️ {len(warnings_list)} quality warnings to address") 
-        print(f"   🤖 {len(ai_feedback_list)} AI recommendations to implement")
+        print(f"   ⚠️ {len(warnings_list)} quality warnings to address")
+        if ENABLE_AI_ANALYSIS:
+            print(f"   🤖 {len(ai_feedback_list)} AI recommendations to implement")
         print(f"   📋 {len(all_quality_issues)} total feedback points provided")
         print(f"🎯 Target: Reduce {len(warnings_list)} warnings to ≤ {WARNING_THRESHOLD} and eliminate all critical issues")
     else:
@@ -617,10 +631,10 @@ def code_checker(state: State, instructor_client: Instructor) -> State:
     else:
         check_results.append("✓ Function name follows Python conventions")
     
-    # 8. AI-Powered Code Analysis (only if no critical syntax errors)
+    # 8. AI-Powered Code Analysis (only if no critical syntax errors and AI analysis is enabled)
     ai_detailed_analysis = ""
     
-    if critical_issues == 0:  # Only run AI analysis if no critical syntax/security issues
+    if critical_issues == 0 and ENABLE_AI_ANALYSIS:  # Only run AI analysis if no critical syntax/security issues and enabled
         logger.info("Performing AI-powered code analysis...")
         
         ai_analysis_prompt = f"""
@@ -746,9 +760,13 @@ Detailed Expert Feedback:
             warnings += 1
             ai_detailed_analysis = "AI analysis was not available due to an error." + f" Error details: {str(e)}"
     else:
-        # Skip AI analysis due to critical issues
-        check_results.append("⚠ Skipping AI analysis due to critical syntax/security errors")
-        ai_detailed_analysis = "AI analysis was skipped due to critical syntax or security errors that prevent code analysis."
+        # Skip AI analysis due to critical issues or configuration
+        if critical_issues > 0:
+            check_results.append("⚠ Skipping AI analysis due to critical syntax/security errors")
+            ai_detailed_analysis = "AI analysis was skipped due to critical syntax or security errors that prevent code analysis."
+        else:
+            check_results.append("ℹ️ AI analysis disabled by configuration setting")
+            ai_detailed_analysis = "AI analysis was disabled by configuration setting. To enable detailed AI code analysis, set ENABLE_AI_ANALYSIS=True in the configuration constants."
     
     # Final Assessment with structured feedback
     total_issues = critical_issues + warnings
@@ -1370,35 +1388,81 @@ def application() -> Application:
 
 
 if __name__ == "__main__":
-  app = application()
-  app.visualize(
-      include_conditions=True,
-      format="png",
-      output_file_path="ai_workflow",
-  )
-  
-  # simple task to test the workflow
-  # app.run(
-  #     halt_after=["end"],
-  #     inputs={"task": """Create a Python function that calculates the factorial of a number using recursion.
-  #             The function should handle edge cases like negative numbers and zero, and include comprehensive unit tests
-  #             to validate its correctness."""})
-  
-  # moderately complex task to test the workflow
-  # app.run(
-  #   halt_after=["end"],
-  #   inputs={"task": """Create a function that analyzes a CSV file containing student grades and calculates comprehensive statistics
-  #           including mean, median, standard deviation, letter grade distribution, and identifies students who need academic intervention
-  #           (below 70% average). The function should handle missing data, validate input formats, and return a detailed report
-  #           with visualizations.
-  #           """})
-  
-  # very complex task to test the workflow
-  app.run(
-    halt_after=["end"],
-    inputs={"task": """Create a Python function that implements a multi-threaded web scraper to extract product prices
-            from an e-commerce website. The scraper should handle pagination, respect robots.txt rules, and implement error handling
-            for network issues. It should return a structured JSON object with product names, prices, and URLs.
-            Additionally, include comprehensive unit tests to validate the scraper's functionality and performance under load.
-            The function should also log its activity and handle rate limiting to avoid being blocked by the website.
-            """})
+    import sys
+    
+    # Define the three sample tasks
+    tasks = {
+        "simple": """Create a Python function that calculates the factorial of a number using recursion.
+                The function should handle edge cases like negative numbers and zero, and include comprehensive unit tests
+                to validate its correctness.""",
+        
+        "moderate": """Create a function that analyzes a CSV file containing student grades and calculates comprehensive statistics
+                including mean, median, standard deviation, letter grade distribution, and identifies students who need academic intervention
+                (below 70% average). The function should handle missing data, validate input formats, and return a detailed report
+                with visualizations.""",
+        
+        "complex": """Create a Python function that implements a multi-threaded web scraper to extract product prices
+                from an e-commerce website. The scraper should handle pagination, respect robots.txt rules, and implement error handling
+                for network issues. It should return a structured JSON object with product names, prices, and URLs.
+                Additionally, include comprehensive unit tests to validate the scraper's functionality and performance under load.
+                The function should also log its activity and handle rate limiting to avoid being blocked by the website."""
+    }
+    
+    app = application()
+    app.visualize(
+        include_conditions=True,
+        format="png",
+        output_file_path="ai_workflow",
+    )
+    
+    # Check command line arguments
+    if len(sys.argv) > 1:
+        task_type = sys.argv[1].lower()
+        if task_type in tasks:
+            print(f"\n🎯 Running {task_type.upper()} task...")
+            app.run(
+                halt_after=["end"],
+                inputs={"task": tasks[task_type]}
+            )
+        elif task_type == "all":
+            print("\n🚀 Running ALL three tasks sequentially...")
+            for task_name, task_description in tasks.items():
+                print(f"\n{'='*80}")
+                print(f"🎯 Starting {task_name.upper()} task...")
+                print(f"{'='*80}")
+                
+                # Create a new app instance for each task to ensure clean state
+                task_app = application()
+                task_app.run(
+                    halt_after=["end"],
+                    inputs={"task": task_description}
+                )
+                
+                print(f"\n✅ Completed {task_name.upper()} task!")
+                print(f"{'='*80}")
+        else:
+            print(f"❌ Unknown task type: {task_type}")
+            print("Available options: simple, moderate, complex, all")
+            sys.exit(1)
+    else:
+        # Default behavior - show options
+        print("\n🤖 AI Python Coding Agent - Task Runner")
+        print("="*50)
+        print("Usage: python 01_ai_workflow.py <task_type>")
+        print("\nAvailable task types:")
+        print("  simple   - Factorial function with recursion")
+        print("  moderate - CSV student grades analysis")
+        print("  complex  - Multi-threaded web scraper")
+        print("  all      - Run all three tasks sequentially")
+        print("\nExamples:")
+        print("  python 01_ai_workflow.py simple")
+        print("  python 01_ai_workflow.py moderate")
+        print("  python 01_ai_workflow.py complex")
+        print("  python 01_ai_workflow.py all")
+        print("\nRunning moderate task by default...")
+        
+        # Run moderate task as default
+        app.run(
+            halt_after=["end"],
+            inputs={"task": tasks["moderate"]}
+        )
