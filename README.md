@@ -13,4 +13,6 @@ source .venv/bin/activate # Activate the virtual environment
 cd 01_ai_workflow
 uv run 001_test.py
 
+# run all AI workflow samples
+uv run 01_ai_workflow.py all
 ```
