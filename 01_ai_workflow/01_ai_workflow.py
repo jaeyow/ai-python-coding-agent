@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 MAX_RETRIES = 5
 WARNING_THRESHOLD = 5
 ENABLE_AI_ANALYSIS = False  # Set to False to disable AI analysis step
+ENABLE_CODE_EXECUTION = True  # Set to True to enable actual Python code execution testing
 
 class CodeAnalysisResponse(BaseModel):
     """AI-powered code analysis response with detailed quality assessment."""
@@ -329,7 +330,7 @@ def code_generator(state: State, instructor_client: Instructor, task: str) -> St
             user_prompt += """
 - Use the exact improvements suggested by the AI analysis"""
             
-        user_prompt += """
+        user_prompt += f"""
 - Ensure the function name, structure, and implementation follow all best practices
 
 🎖️ QUALITY STANDARD: This retry must produce enterprise-grade, production-ready code that addresses every single point of feedback from the previous attempt."""
@@ -631,7 +632,122 @@ def code_checker(state: State, instructor_client: Instructor) -> State:
     else:
         check_results.append("✓ Function name follows Python conventions")
     
-    # 8. AI-Powered Code Analysis (only if no critical syntax errors and AI analysis is enabled)
+    # 7.5. Python Code Execution Testing (configurable)
+    if ENABLE_CODE_EXECUTION and critical_issues == 0:  # Only execute if no critical syntax errors
+        logger.info("Performing Python code execution testing...")
+        
+        try:
+            import subprocess
+            import tempfile
+            import os
+            import sys
+            
+            # Create a temporary file with the generated code
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as temp_file:
+                # Prepare the code for execution
+                execution_code = generated_response.code
+                
+                # Add basic import handling if dependencies are specified
+                if generated_response.dependencies:
+                    import_statements = []
+                    for dep in generated_response.dependencies:
+                        if dep.startswith('import ') or dep.startswith('from '):
+                            import_statements.append(dep)
+                    
+                    if import_statements:
+                        execution_code = '\n'.join(import_statements) + '\n\n' + execution_code
+                
+                # Add a simple test execution at the end to verify the function can be called
+                function_name = generated_response.function_name
+                execution_code += f"""
+
+# Simple execution test
+if __name__ == "__main__":
+    try:
+        # Test if function is defined and callable
+        if '{function_name}' in globals() and callable(globals()['{function_name}']):
+            print("✓ Function '{function_name}' is defined and callable")
+        else:
+            print("✗ Function '{function_name}' is not properly defined")
+    except Exception as e:
+        print(f"✗ Error during execution test: {{e}}")
+"""
+                
+                temp_file.write(execution_code)
+                temp_file_path = temp_file.name
+            
+            # Execute the code in a subprocess with timeout
+            try:
+                result = subprocess.run(
+                    [sys.executable, temp_file_path],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,  # 10 second timeout
+                    cwd=os.path.dirname(temp_file_path)
+                )
+                
+                # Check execution results
+                if result.returncode == 0:
+                    check_results.append("✓ Code execution completed successfully")
+                    
+                    # Check for any error messages in stdout
+                    if "✗" in result.stdout:
+                        check_results.append("⚠ Warning: Execution test found issues:")
+                        for line in result.stdout.split('\n'):
+                            if line.strip() and "✗" in line:
+                                check_results.append(f"  {line.strip()}")
+                                warnings += 1
+                    elif "✓" in result.stdout:
+                        check_results.append("✓ Function definition and callability verified")
+                    
+                    # Check for any warnings or issues in stdout
+                    if result.stdout.strip():
+                        execution_output = result.stdout.strip()
+                        if execution_output and not execution_output.startswith("✓"):
+                            check_results.append(f"📋 Execution output: {execution_output}")
+                
+                else:
+                    check_results.append(f"✗ CRITICAL: Code execution failed with return code {result.returncode}")
+                    critical_issues += 1
+                    
+                    if result.stderr:
+                        error_lines = result.stderr.strip().split('\n')
+                        # Show only the most relevant error lines
+                        relevant_errors = [line for line in error_lines if line.strip() and not line.startswith('  File')]
+                        if relevant_errors:
+                            check_results.append(f"✗ CRITICAL: Execution error - {relevant_errors[-1]}")
+                    
+            except subprocess.TimeoutExpired:
+                check_results.append("✗ CRITICAL: Code execution timed out (>10 seconds)")
+                critical_issues += 1
+            except Exception as subprocess_error:
+                check_results.append(f"✗ CRITICAL: Failed to execute code - {subprocess_error}")
+                critical_issues += 1
+            
+            # Clean up temporary file
+            try:
+                os.unlink(temp_file_path)
+            except:
+                pass  # Ignore cleanup errors
+                
+        except Exception as e:
+            check_results.append(f"⚠ Warning: Code execution testing failed - {e}")
+            warnings += 1
+            
+    elif ENABLE_CODE_EXECUTION and critical_issues > 0:
+        check_results.append("⚠ Skipping code execution due to critical syntax errors")
+    elif not ENABLE_CODE_EXECUTION:
+        check_results.append("ℹ️ Code execution testing disabled by configuration")
+
+    # 8. Function Name Validation
+    function_name = generated_response.function_name
+    if not function_name.islower() or not function_name.replace('_', '').isalnum():
+        check_results.append("⚠ Warning: Function name should follow snake_case convention")
+        warnings += 1
+    else:
+        check_results.append("✓ Function name follows Python conventions")
+    
+    # 9. AI-Powered Code Analysis (only if no critical syntax errors and AI analysis is enabled)
     ai_detailed_analysis = ""
     
     if critical_issues == 0 and ENABLE_AI_ANALYSIS:  # Only run AI analysis if no critical syntax/security issues and enabled
