@@ -45,24 +45,6 @@ def generate_code(requirement: str) -> str:
     # Create bedrock runtime client
     bedrock_runtime = session.client('bedrock-runtime')
     
-    # Construct the prompt for code generation
-    prompt = f"""
-Human: Please generate Python code that implements the following requirement:
-
-{requirement}
-
-Requirements for the generated code:
-1. Include proper type hints
-2. Add comprehensive docstrings following Google/Sphinx style
-3. Implement proper error handling where appropriate
-4. Follow PEP 8 style guidelines
-5. Include input validation where necessary
-6. Make the code production-ready and well-documented
-
-Please provide only the Python code without any additional explanation or markdown formatting.
-Assistant:"""
-    
-    # Call the Bedrock AI model for code generation using the Invoke Model API
     try:
         body = json.dumps({
             "anthropic_version": "bedrock-2023-05-31",
@@ -109,21 +91,7 @@ Please provide only the Python code without any additional explanation or markdo
     except Exception as e:
         error_msg = f"Error calling Bedrock model: {str(e)}"
         print(f"❌ {error_msg}")
-        # Return a fallback simple implementation for basic requirements
-        if "add" in requirement.lower() and "number" in requirement.lower():
-            return """def add_numbers(a: float, b: float) -> float:
-    \"\"\"Add two numbers together.
-    
-    Args:
-        a: First number
-        b: Second number
-        
-    Returns:
-        Sum of the two numbers
-    \"\"\"
-    return a + b"""
-        else:
-            raise Exception(error_msg)
+        raise Exception(error_msg)
 
 @tool
 def validate_code(code: str, requirement: str) -> List[str]:
@@ -211,6 +179,7 @@ class CodingAgent:
         
         self.agent = Agent(
             model=bedrock_model,
+            tools=[generate_code, validate_code],
             system_prompt="""
         You are an advanced Python Coding Agent with iterative improvement capabilities. You help users implement high-quality Python code through an intelligent feedback loop system.
         
@@ -242,8 +211,7 @@ class CodingAgent:
         - Any design decisions and architectural choices
         - How to use the code with examples
         - Any improvements made during the iterative process
-        """,
-            tools=[generate_code, validate_code]
+        """
         )
     
     async def run_workflow(self, requirement: str) -> Dict[str, Any]:
