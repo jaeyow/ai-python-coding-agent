@@ -268,6 +268,10 @@ class CodingAgent:
         best_validation_results = []
         best_issues_count = float('inf')
         
+        # Track detailed iteration metrics
+        iteration_metrics = []
+        iteration_start_time = start_time
+        
         # Run the agent workflow with iterative improvement
         try:
             user_message = f"""
@@ -298,7 +302,8 @@ class CodingAgent:
                 response = self.agent(user_message)
                 
                 # Calculate execution time for this iteration
-                iteration_time = time.time() - start_time
+                iteration_end_time = time.time()
+                iteration_duration = iteration_end_time - iteration_start_time
                 
                 # Extract response content
                 response_content = ""
@@ -352,6 +357,15 @@ class CodingAgent:
                 print(f"  Compilation errors: {compilation_errors}")
                 print(f"  Improvement threshold: {improvement_threshold}")
                 
+                # Track iteration metrics
+                iteration_metrics.append({
+                    "iteration": current_iteration,
+                    "issues_count": issues_count,
+                    "duration": iteration_duration,
+                    "code_length": len(generated_code),
+                    "validation_count": len(validation_results)
+                })
+                
                 # Preserve the best results (lowest issue count with valid code)
                 if generated_code and (issues_count < best_issues_count or not best_generated_code):
                     best_generated_code = generated_code
@@ -385,6 +399,8 @@ class CodingAgent:
         
         Target: Reduce issues to {improvement_threshold} or fewer.
         """
+                    # Update iteration start time for next iteration
+                    iteration_start_time = time.time()
                     continue
                 else:
                     print(f"✅ Stopping iteration - Issues ({issues_count}) within acceptable range")
@@ -409,7 +425,8 @@ class CodingAgent:
                 "success": bool(final_generated_code) and len([msg for msg in final_validation_results if "syntax error" in msg.lower() or "compilation error" in msg.lower()]) == 0,
                 "code_metrics": self.analyze_code_quality(final_generated_code) if final_generated_code else {},
                 "iterations_used": current_iteration,
-                "final_issues_count": final_issues_count
+                "final_issues_count": final_issues_count,
+                "iteration_metrics": iteration_metrics
             }
             
             self.session_data["scenarios"].append(scenario_data)
@@ -607,6 +624,16 @@ class CodingAgent:
 
 """
             
+            # Add iteration breakdown if available
+            if scenario.get("iteration_metrics"):
+                report += "**Iteration Breakdown:**\n"
+                for metric in scenario["iteration_metrics"]:
+                    duration = metric.get("duration", 0)
+                    issues = metric.get("issues_count", 0)
+                    iteration_num = metric.get("iteration", 0)
+                    report += f"- Iteration {iteration_num}: {issues} issues, {duration:.1f}s\n"
+                report += "\n"
+            
             if scenario.get("success") and scenario.get("code_metrics"):
                 metrics = scenario["code_metrics"]
                 report += f"""**Code Metrics:**
@@ -644,9 +671,7 @@ class CodingAgent:
 **Requirement:** {requirement}
 
 **Generated Code:**
-```python
 {code}
-```
 
 **Code Metrics:**
 - Lines of Code: {scenario.get("code_metrics", {}).get("lines_of_code", 0)}
