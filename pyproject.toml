@@ -10,4 +10,8 @@ dependencies = [
     "boto3>=1.38.32",
     "burr[start]>=0.40.2",
     "instructor>=1.8.3",
+    "python-dotenv>=1.1.0",
+    "strands-agents>=0.0.1",
+    "strands-agents-builder>=0.0.1",
+    "strands-agents-tools>=0.0.1",
 ]
